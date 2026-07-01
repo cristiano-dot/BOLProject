@@ -19,11 +19,8 @@ const TONES = [
   { id: "brief", label: "Brief & Direct" },
   { id: "apologetic", label: "Apologetic" },
 ];
-const MCP_SERVER = {
-  type: "url",
-  url: "https://drivemcp.googleapis.com/mcp/v1",
-  name: "google-drive-mcp",
-};
+const MCP_SERVER_URL = "https://drivemcp.googleapis.com/mcp/v1";
+const MCP_SERVER_NAME = "google-drive-mcp";
 
 // ── Status composer prompt ────────────────────────────────────────────────────
 const statusSystemPrompt = `You are an order management specialist at Smith Corona, helping compose clear, professional customer-facing order status emails.
@@ -159,12 +156,21 @@ export default function App() {
   // ── Fix 1 & 2: API key gate — stored in localStorage, sent with every request ──
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("sc_anthropic_key") || "");
   const [apiKeyInput, setApiKeyInput] = useState("");
+  const [googleToken, setGoogleToken] = useState(() => localStorage.getItem("sc_google_token") || "");
+  const [googleTokenInput, setGoogleTokenInput] = useState("");
 
   const saveApiKey = () => {
     const trimmed = apiKeyInput.trim();
     if (!trimmed) return;
     localStorage.setItem("sc_anthropic_key", trimmed);
     setApiKey(trimmed);
+  };
+
+  const saveGoogleToken = () => {
+    const trimmed = googleTokenInput.trim();
+    if (!trimmed) return;
+    localStorage.setItem("sc_google_token", trimmed);
+    setGoogleToken(trimmed);
   };
 
   // Shared headers used by every Anthropic API call
@@ -231,8 +237,8 @@ export default function App() {
           max_tokens: 4000,
           system: makeLookupPrompt("single"),
           messages: [{ role: "user", content: `Search for order/PO: "${statusSearch.trim()}"` }],
-          mcp_servers: [MCP_SERVER],
-          tools: [{ type: "mcp_toolset", mcp_server_name: MCP_SERVER.name }],
+          mcp_servers: [{ type: "url", url: MCP_SERVER_URL, name: MCP_SERVER_NAME, authorization_token: googleToken }],
+          tools: [{ type: "mcp_toolset", mcp_server_name: MCP_SERVER_NAME }],
         }),
       });
       const data = await res.json();
@@ -325,8 +331,8 @@ Rep/User: ${statusSelected.userId}`;
               ? "Scan the sheet for all orders ready for customer pickup."
               : `Search for order/PO: "${pickupSearch.trim()}"`,
           }],
-          mcp_servers: [MCP_SERVER],
-          tools: [{ type: "mcp_toolset", mcp_server_name: MCP_SERVER.name }],
+          mcp_servers: [{ type: "url", url: MCP_SERVER_URL, name: MCP_SERVER_NAME, authorization_token: googleToken }],
+          tools: [{ type: "mcp_toolset", mcp_server_name: MCP_SERVER_NAME }],
         }),
       });
       const data = await res.json();
@@ -548,8 +554,11 @@ ${pickupExtra ? `Additional context: ${pickupExtra}` : ""}`;
     padding: "16px 18px",
   };
 
-  // ── API key gate ──────────────────────────────────────────────────────────────
-  if (!apiKey) {
+  // ── API key + Google token gate ───────────────────────────────────────────────
+  if (!apiKey || !googleToken) {
+    const needsApiKey = !apiKey;
+    const canSubmitApiKey = apiKeyInput.trim();
+    const canSubmitGoogleToken = googleTokenInput.trim();
     return (
       <div style={{ fontFamily: "'Inter', 'Segoe UI', sans-serif", background: "#F7F8FA", minHeight: "100vh" }}>
         <div style={{ background: "#1A1F2E", padding: "20px 32px", display: "flex", alignItems: "center", gap: "12px" }}>
@@ -559,27 +568,58 @@ ${pickupExtra ? `Additional context: ${pickupExtra}` : ""}`;
             <div style={{ color: "#8892A4", fontSize: "12px", marginTop: "1px" }}>Pulls live from your order report</div>
           </div>
         </div>
-        <div style={{ maxWidth: "480px", margin: "80px auto", padding: "0 24px" }}>
-          <div style={{ ...cardStyle, padding: "32px" }}>
-            <div style={{ fontWeight: "700", fontSize: "15px", color: "#1A1F2E", marginBottom: "8px" }}>Enter your Anthropic API Key</div>
-            <div style={{ fontSize: "13px", color: "#6B7A99", marginBottom: "20px" }}>Your key is stored locally in this browser and never sent anywhere except directly to Anthropic.</div>
-            <input
-              type="password"
-              value={apiKeyInput}
-              onChange={(e) => setApiKeyInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && saveApiKey()}
-              placeholder="sk-ant-..."
-              style={{ ...inputStyle, padding: "10px 14px", fontSize: "14px", marginBottom: "12px" }}
-              autoFocus
-            />
-            <button
-              onClick={saveApiKey}
-              disabled={!apiKeyInput.trim()}
-              style={{ background: apiKeyInput.trim() ? "#4A7CFF" : "#A0ABBE", color: "#fff", border: "none", borderRadius: "8px", padding: "12px 24px", fontSize: "13px", fontWeight: "700", cursor: apiKeyInput.trim() ? "pointer" : "not-allowed", width: "100%" }}
-            >
-              Save & Continue
-            </button>
-          </div>
+        <div style={{ maxWidth: "480px", margin: "80px auto", padding: "0 24px", display: "flex", flexDirection: "column", gap: "16px" }}>
+          {needsApiKey && (
+            <div style={{ ...cardStyle, padding: "32px" }}>
+              <div style={{ fontWeight: "700", fontSize: "15px", color: "#1A1F2E", marginBottom: "8px" }}>Anthropic API Key</div>
+              <div style={{ fontSize: "13px", color: "#6B7A99", marginBottom: "20px" }}>Stored locally in this browser — never sent anywhere except Anthropic.</div>
+              <input
+                type="password"
+                value={apiKeyInput}
+                onChange={(e) => setApiKeyInput(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && canSubmitApiKey && saveApiKey()}
+                placeholder="sk-ant-..."
+                style={{ ...inputStyle, padding: "10px 14px", fontSize: "14px", marginBottom: "12px" }}
+                autoFocus={needsApiKey}
+              />
+              <button
+                onClick={saveApiKey}
+                disabled={!canSubmitApiKey}
+                style={{ background: canSubmitApiKey ? "#4A7CFF" : "#A0ABBE", color: "#fff", border: "none", borderRadius: "8px", padding: "12px 24px", fontSize: "13px", fontWeight: "700", cursor: canSubmitApiKey ? "pointer" : "not-allowed", width: "100%" }}
+              >
+                Save API Key
+              </button>
+            </div>
+          )}
+          {!needsApiKey && (
+            <div style={{ ...cardStyle, padding: "32px" }}>
+              <div style={{ fontWeight: "700", fontSize: "15px", color: "#1A1F2E", marginBottom: "8px" }}>Google OAuth Token</div>
+              <div style={{ fontSize: "13px", color: "#6B7A99", marginBottom: "4px" }}>Required to read your Google Sheet via the Drive MCP connector.</div>
+              <div style={{ fontSize: "12px", color: "#6B7A99", marginBottom: "20px" }}>
+                Get a token from{" "}
+                <a href="https://developers.google.com/oauthplayground/" target="_blank" rel="noreferrer" style={{ color: "#4A7CFF" }}>
+                  Google OAuth Playground
+                </a>
+                {" "}— select <strong>Drive API v3</strong> scope, authorize, then copy the Access Token. Tokens expire after 1 hour.
+              </div>
+              <input
+                type="password"
+                value={googleTokenInput}
+                onChange={(e) => setGoogleTokenInput(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && canSubmitGoogleToken && saveGoogleToken()}
+                placeholder="ya29.a0..."
+                style={{ ...inputStyle, padding: "10px 14px", fontSize: "14px", marginBottom: "12px" }}
+                autoFocus
+              />
+              <button
+                onClick={saveGoogleToken}
+                disabled={!canSubmitGoogleToken}
+                style={{ background: canSubmitGoogleToken ? "#4A7CFF" : "#A0ABBE", color: "#fff", border: "none", borderRadius: "8px", padding: "12px 24px", fontSize: "13px", fontWeight: "700", cursor: canSubmitGoogleToken ? "pointer" : "not-allowed", width: "100%" }}
+              >
+                Save & Continue
+              </button>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -594,12 +634,20 @@ ${pickupExtra ? `Additional context: ${pickupExtra}` : ""}`;
           <div style={{ color: "#fff", fontWeight: "700", fontSize: "16px", letterSpacing: "-0.02em" }}>Smith Corona · Order Communications</div>
           <div style={{ color: "#8892A4", fontSize: "12px", marginTop: "1px" }}>Pulls live from your order report</div>
         </div>
-        <button
-          onClick={() => { localStorage.removeItem("sc_anthropic_key"); setApiKey(""); setApiKeyInput(""); }}
-          style={{ background: "none", border: "1px solid #3A4158", borderRadius: "6px", color: "#8892A4", fontSize: "12px", padding: "6px 12px", cursor: "pointer" }}
-        >
-          Change API Key
-        </button>
+        <div style={{ display: "flex", gap: "8px" }}>
+          <button
+            onClick={() => { localStorage.removeItem("sc_google_token"); setGoogleToken(""); setGoogleTokenInput(""); }}
+            style={{ background: "none", border: "1px solid #3A4158", borderRadius: "6px", color: "#8892A4", fontSize: "12px", padding: "6px 12px", cursor: "pointer" }}
+          >
+            Refresh Google Token
+          </button>
+          <button
+            onClick={() => { localStorage.removeItem("sc_anthropic_key"); setApiKey(""); setApiKeyInput(""); }}
+            style={{ background: "none", border: "1px solid #3A4158", borderRadius: "6px", color: "#8892A4", fontSize: "12px", padding: "6px 12px", cursor: "pointer" }}
+          >
+            Change API Key
+          </button>
+        </div>
       </div>
 
       {/* Tabs */}
