@@ -170,9 +170,10 @@ export default function App() {
   // Shared headers used by every Anthropic API call
   const anthropicHeaders = {
     "Content-Type": "application/json",
-    "x-api-key": apiKey,                                  // Fix 1: was missing
+    "x-api-key": apiKey,
     "anthropic-version": "2023-06-01",
-    "anthropic-dangerous-direct-browser-access": "true",  // Fix 2: was missing
+    "anthropic-beta": "mcp-client-2025-04-04",
+    "anthropic-dangerous-direct-browser-access": "true",
   };
 
   const [tab, setTab] = useState("status"); // "status" | "pickup"
