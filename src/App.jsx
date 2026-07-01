@@ -232,6 +232,7 @@ export default function App() {
           system: makeLookupPrompt("single"),
           messages: [{ role: "user", content: `Search for order/PO: "${statusSearch.trim()}"` }],
           mcp_servers: [MCP_SERVER],
+          tools: [{ type: "mcp_toolset", mcp_server_name: MCP_SERVER.name }],
         }),
       });
       const data = await res.json();
@@ -325,6 +326,7 @@ Rep/User: ${statusSelected.userId}`;
               : `Search for order/PO: "${pickupSearch.trim()}"`,
           }],
           mcp_servers: [MCP_SERVER],
+          tools: [{ type: "mcp_toolset", mcp_server_name: MCP_SERVER.name }],
         }),
       });
       const data = await res.json();
