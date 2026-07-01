@@ -1,6 +1,8 @@
 import { useState } from "react";
 
 const SHEET_ID = "1GGPDtzu_BKb3x2bpzfWK794-H1ny9TTu_cQ2KiZ1eXY";
+const SHEETS_BASE = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}`;
+
 const PICKUP_STATIC = {
   address: "3841 Perkins Ave, Cleveland, OH 44114",
   freightClass: "70",
@@ -19,8 +21,6 @@ const TONES = [
   { id: "brief", label: "Brief & Direct" },
   { id: "apologetic", label: "Apologetic" },
 ];
-const MCP_SERVER_URL = "https://drivemcp.googleapis.com/mcp/v1";
-const MCP_SERVER_NAME = "google-drive-mcp";
 
 // ── Status composer prompt ────────────────────────────────────────────────────
 const statusSystemPrompt = `You are an order management specialist at Smith Corona, helping compose clear, professional customer-facing order status emails.
@@ -56,52 +56,90 @@ Always include:
 
 Format: Subject line first (prefixed with "Subject:"), then a blank line, then the email body. Sign off as: "[Your Name] | Customer Support | Smith Corona" Keep it under 200 words. Professional, clear, no filler.`;
 
-// ── Shared order lookup prompt ────────────────────────────────────────────────
-const makeLookupPrompt = (mode) => `You have access to Google Drive. Look up order data from Google Sheet (file ID: ${SHEET_ID}).
+// ── Google Sheets fetch + parse ───────────────────────────────────────────────
+const fetchOpenOrders = async (googleToken) => {
+  const tab = encodeURIComponent("Open Orders");
+  const res = await fetch(`${SHEETS_BASE}/values/${tab}?majorDimension=ROWS`, {
+    headers: { Authorization: `Bearer ${googleToken}` },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    if (res.status === 401) throw new Error("Google token expired — click Refresh Google Token in the header.");
+    if (res.status === 403) throw new Error("Permission denied — make sure you authorized the spreadsheets.readonly scope in OAuth Playground.");
+    throw new Error(err.error?.message || `Sheets API error ${res.status}`);
+  }
+  return res.json();
+};
 
-IMPORTANT: This file has multiple tabs — "Sheet1" (the full master report, which may be too large to read completely) and "Open Orders" (a filtered view containing only rows where Source = "open", which is small enough to read in full and is reliably complete). ALWAYS use the data from the "Open Orders" tab for your search, not Sheet1. If you cannot tell which tab a row came from, prefer rows that appear in the second/later table block, which corresponds to "Open Orders".
+const SHEET_COL = {
+  orderNumber: "Order #",
+  company: "Co",
+  userId: "User ID",
+  entered: "Entered",
+  shipped: "Shipped",
+  invoicePrinted: "Invoice Printed",
+  customerPO: "Customer PO",
+  source: "Source",
+  fob: "FOB",
+  carrier: "Carrier",
+  shippedWeight: "Shipped Weight",
+  tracking: "Tracking #s",
+};
 
-The sheet columns are: Order #, Co, User ID, Entered, Shipped, Invoice Printed, Customer PO, Source, FOB, Carrier, Shipped Weight, Tracking #s.
+const parseOrders = (sheetsResponse) => {
+  const rows = sheetsResponse.values || [];
+  if (rows.length < 2) return [];
+  const headerRow = rows[0];
+  const idx = {};
+  Object.entries(SHEET_COL).forEach(([key, label]) => {
+    idx[key] = headerRow.findIndex((h) => h.trim() === label);
+  });
+  const get = (row, key) => {
+    const i = idx[key];
+    return i >= 0 && i < row.length && row[i] ? row[i].trim() : "";
+  };
+  return rows
+    .slice(1)
+    .filter((row) => get(row, "orderNumber"))
+    .map((row) => {
+      const shipped = get(row, "shipped");
+      const invoicePrinted = get(row, "invoicePrinted");
+      const fob = get(row, "fob");
+      const carrier = get(row, "carrier");
+      let status = "Pending - not yet shipped";
+      if (invoicePrinted) status = "Fully shipped and invoiced";
+      else if (shipped) status = "Shipped - awaiting invoice";
+      const readyForPickup = !!(
+        shipped &&
+        !invoicePrinted &&
+        (fob === "Customer Provided BOL" || fob === "Pick Up" || (fob === "Collect" && carrier === "Special"))
+      );
+      return {
+        orderNumber: get(row, "orderNumber"),
+        company: get(row, "company"),
+        userId: get(row, "userId"),
+        entered: get(row, "entered"),
+        shipped,
+        invoicePrinted,
+        customerPO: get(row, "customerPO"),
+        source: get(row, "source"),
+        fob,
+        carrier,
+        shippedWeight: get(row, "shippedWeight"),
+        tracking: get(row, "tracking"),
+        status,
+        readyForPickup,
+      };
+    });
+};
 
-Note: every row in "Open Orders" will have Source = "open" by definition, since "history" (already invoiced) rows are excluded from that tab.
-
-${mode === "scan"
-  ? `Read ALL rows and return only orders that are ready for customer freight pickup (i.e. the customer needs to be notified to arrange pickup).`
-  : `Find the row(s) matching the search term. The search term may be an Order # (like "29518") or a Customer PO number.`}
-
-${mode === "scan" || mode === "pickup_single"
-  ? ` PICKUP-READINESS RULE (apply this to every order you return, computing readyForPickup independently for each row — this is a precise boolean test, not a judgment call): A row is ready for pickup (readyForPickup = true) when ALL three of these are true:
-
-1. The "Shipped" column is populated (not blank)
-2. The "Invoice Printed" column is empty/blank
-3. The FOB value is EXACTLY one of these (check FOB alone first — these two values are ALWAYS pickup-ready regardless of carrier):
-   * FOB = "Customer Provided BOL" → ALWAYS readyForPickup = true (carrier does not matter)
-   * FOB = "Pick Up" → ALWAYS readyForPickup = true (carrier does not matter)
-   * FOB = "Collect" AND Carrier = "Special" (both must match exactly) → readyForPickup = true
-   * Any other FOB value (e.g. "PrePaid/Add", "PrePaid", "Third Party", or "Collect" paired with any carrier other than "Special") → readyForPickup = false
-
-Do this check independently of the Shipped/Invoice Printed check — a row can satisfy condition 3 but still be readyForPickup = false if Shipped is blank or Invoice Printed is filled.
-${mode === "scan"
-  ? "Only include rows in the output where readyForPickup = true."
-  : "Include the order regardless of its readyForPickup value, and report that value accurately."}`
-  : ""}
-
-Return ONLY a JSON object, no other text.
-
-${mode === "scan"
-  ? `Since every matching row will have invoicePrinted blank, source "open", and readyForPickup true by definition, OMIT those three fields from each order object in scan mode to save space — only include them if mode were not scan. Use this compact shape for each order:
-{ "found": true, "fobFilterApplied": true, "orders": [ { "orderNumber": "29518", "userId": "BEVACK", "entered": "06/11/2026 4:00:25 PM", "shipped": "06/12/2026 4:29:06 AM", "customerPO": "654334", "fob": "Collect", "carrier": "Special", "shippedWeight": "1410.224", "tracking": "", "status": "Shipped - awaiting invoice" } ] }
-Be as terse as possible — no extra whitespace, no markdown, no commentary before or after the JSON. If you are running low on output budget, it is far better to return fewer complete order objects than to truncate mid-object. Prioritize completing the JSON structure over including every single matching row.`
-  : `Use this full shape for each order:
-{ "found": true, "fobFilterApplied": true, "orders": [ { "orderNumber": "29518", "company": "10", "userId": "BEVACK", "entered": "06/11/2026 4:00:25 PM", "shipped": "06/12/2026 4:29:06 AM", "invoicePrinted": "", "customerPO": "654334", "fob": "Collect", "carrier": "Special", "shippedWeight": "1410.224", "tracking": "", "source": "open", "status": "Shipped - awaiting invoice", "readyForPickup": true } ] }`}
-
-If not found or no matches: { "found": false, "fobFilterApplied": true, "orders": [] }
-
-Field notes:
-* fob / carrier / shippedWeight / tracking: populate directly from the sheet columns (FOB, Carrier, Shipped Weight, Tracking #s). Use empty string if blank.
-* readyForPickup: true only if the pickup conditions above are met
-* status: "Pending - not yet shipped" | "Shipped - awaiting invoice" | "Fully shipped and invoiced" (based on whether Shipped/Invoice Printed are filled)
-* fobFilterApplied should always be true since FOB and Carrier columns exist in this sheet.`;
+const matchesSearch = (order, query) => {
+  const q = query.toLowerCase().trim();
+  return (
+    order.orderNumber.toLowerCase().includes(q) ||
+    order.customerPO.toLowerCase().includes(q)
+  );
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const statusColor = (status) => {
@@ -111,49 +149,11 @@ const statusColor = (status) => {
   return "#F59E0B";
 };
 
-const parseJSON = (text) => {
-  const match = text?.match(/{[\s\S]*}/);
-  if (!match) return null;
-  try {
-    return JSON.parse(match[0]);
-  } catch {
-    // Response was likely truncated mid-array (hit max_tokens). Try to salvage
-    // whatever complete order objects exist before the break point.
-    const raw = match[0];
-    const ordersStart = raw.indexOf('"orders"');
-    if (ordersStart === -1) return null;
-    const arrStart = raw.indexOf("[", ordersStart);
-    if (arrStart === -1) return null;
-    // Walk forward tracking brace depth to find complete {...} objects within the array
-    let depth = 0, objStart = -1;
-    const recovered = [];
-    for (let i = arrStart + 1; i < raw.length; i++) {
-      const ch = raw[i];
-      if (ch === "{") {
-        if (depth === 0) objStart = i;
-        depth++;
-      } else if (ch === "}") {
-        depth--;
-        if (depth === 0 && objStart !== -1) {
-          const chunk = raw.slice(objStart, i + 1);
-          try { recovered.push(JSON.parse(chunk)); } catch { /* skip malformed object */ }
-          objStart = -1;
-        }
-      }
-    }
-    if (recovered.length > 0) {
-      return { found: true, fobFilterApplied: true, orders: recovered, _truncated: true };
-    }
-    return null;
-  }
-};
-
 const extractText = (data) =>
   data.content?.filter((b) => b.type === "text").map((b) => b.text).join("") || "";
 
 // ── Component ─────────────────────────────────────────────────────────────────
 export default function App() {
-  // ── Fix 1 & 2: API key gate — stored in localStorage, sent with every request ──
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("sc_anthropic_key") || "");
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [googleToken, setGoogleToken] = useState(() => localStorage.getItem("sc_google_token") || "");
@@ -173,16 +173,14 @@ export default function App() {
     setGoogleToken(trimmed);
   };
 
-  // Shared headers used by every Anthropic API call
   const anthropicHeaders = {
     "Content-Type": "application/json",
     "x-api-key": apiKey,
     "anthropic-version": "2023-06-01",
-    "anthropic-beta": "mcp-client-2025-11-20",
     "anthropic-dangerous-direct-browser-access": "true",
   };
 
-  const [tab, setTab] = useState("status"); // "status" | "pickup"
+  const [tab, setTab] = useState("status");
 
   // ── Status tab state ──
   const [statusSearch, setStatusSearch] = useState("");
@@ -201,7 +199,7 @@ export default function App() {
   const [statusDebug, setStatusDebug] = useState(null);
 
   // ── Pickup tab state ──
-  const [pickupMode, setPickupMode] = useState("scan"); // "scan" | "lookup"
+  const [pickupMode, setPickupMode] = useState("scan");
   const [pickupSearch, setPickupSearch] = useState("");
   const [pickupSearching, setPickupSearching] = useState(false);
   const [pickupOrders, setPickupOrders] = useState(null);
@@ -229,37 +227,18 @@ export default function App() {
     setStatusResult(null);
     setStatusDebug(null);
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: anthropicHeaders,
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: 4000,
-          system: makeLookupPrompt("single"),
-          messages: [{ role: "user", content: `Search for order/PO: "${statusSearch.trim()}"` }],
-          mcp_servers: [{ type: "url", url: MCP_SERVER_URL, name: MCP_SERVER_NAME, authorization_token: googleToken }],
-          tools: [{ type: "mcp_toolset", mcp_server_name: MCP_SERVER_NAME }],
-        }),
-      });
-      const data = await res.json();
-      const text = extractText(data);
-      const parsed = parseJSON(text);
-      setStatusDebug({
-        status: res.status,
-        hasError: !!data.error,
-        errorMsg: data.error?.message,
-        rawText: text,
-        blockTypes: data.content?.map((b) => b.type),
-        parsed,
-      });
-      if (parsed?.found && parsed.orders?.length > 0) {
-        setStatusOrders(parsed.orders);
-        if (parsed.orders.length === 1) setStatusSelected(parsed.orders[0]);
+      const sheetData = await fetchOpenOrders(googleToken);
+      const allOrders = parseOrders(sheetData);
+      const matches = allOrders.filter((o) => matchesSearch(o, statusSearch));
+      setStatusDebug({ totalRows: allOrders.length, matches: matches.length });
+      if (matches.length > 0) {
+        setStatusOrders(matches);
+        if (matches.length === 1) setStatusSelected(matches[0]);
       } else {
         setStatusSearchErr(`No order found matching "${statusSearch}".`);
       }
     } catch (e) {
-      setStatusSearchErr("Lookup failed. Please try again.");
+      setStatusSearchErr(e.message || "Lookup failed. Please try again.");
       setStatusDebug({ caughtError: String(e) });
     } finally {
       setStatusSearching(false);
@@ -318,57 +297,40 @@ Rep/User: ${statusSelected.userId}`;
     setFobNote("");
     setPickupDebug(null);
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: anthropicHeaders,
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: isScan ? 8000 : 4000,
-          system: makeLookupPrompt(isScan ? "scan" : "pickup_single"),
-          messages: [{
-            role: "user",
-            content: isScan
-              ? "Scan the sheet for all orders ready for customer pickup."
-              : `Search for order/PO: "${pickupSearch.trim()}"`,
-          }],
-          mcp_servers: [{ type: "url", url: MCP_SERVER_URL, name: MCP_SERVER_NAME, authorization_token: googleToken }],
-          tools: [{ type: "mcp_toolset", mcp_server_name: MCP_SERVER_NAME }],
-        }),
-      });
-      const data = await res.json();
-      const text = extractText(data);
-      const parsed = parseJSON(text);
-      setPickupDebug({
-        status: res.status,
-        hasError: !!data.error,
-        errorMsg: data.error?.message,
-        rawText: text,
-        blockTypes: data.content?.map((b) => b.type),
-        parsed,
-      });
-      if (parsed?.found && parsed.orders?.length > 0) {
-        const ready = isScan ? parsed.orders : parsed.orders.filter((o) => o.readyForPickup);
-        if (ready.length > 0) {
-          setPickupOrders(ready);
-          if (ready.length === 1) setPickupSelected(ready[0]);
-          if (!parsed.fobFilterApplied)
-            setFobNote("FOB/carrier columns not yet in sheet — showing all shipped-not-invoiced orders.");
-          else if (parsed._truncated)
-            setFobNote("Response was cut off before finishing — the list below may be incomplete. Try narrowing the search or re-running the scan.");
-        } else {
+      const sheetData = await fetchOpenOrders(googleToken);
+      const allOrders = parseOrders(sheetData);
+      let ready;
+      if (isScan) {
+        ready = allOrders.filter((o) => o.readyForPickup);
+        setPickupDebug({ totalRows: allOrders.length, pickupReady: ready.length });
+      } else {
+        const matches = allOrders.filter((o) => matchesSearch(o, pickupSearch));
+        if (matches.length > 0 && matches.every((o) => !o.readyForPickup)) {
+          const m = matches[0];
           setPickupSearchErr(
-            isScan
-              ? "No orders are currently ready for customer pickup."
-              : "That order was found but is not flagged as ready for pickup (check FOB/carrier codes or shipped status)."
+            "That order was found but is not flagged as ready for pickup (check FOB/carrier codes or shipped status)."
           );
+          setPickupDebug({
+            totalRows: allOrders.length,
+            matchedOrder: { orderNumber: m.orderNumber, fob: m.fob, carrier: m.carrier, shipped: m.shipped, invoicePrinted: m.invoicePrinted },
+          });
+          return;
         }
+        ready = matches.filter((o) => o.readyForPickup);
+        setPickupDebug({ totalRows: allOrders.length, matches: matches.length, pickupReady: ready.length });
+      }
+      if (ready.length > 0) {
+        setPickupOrders(ready);
+        if (ready.length === 1) setPickupSelected(ready[0]);
       } else {
         setPickupSearchErr(
-          isScan ? "No orders ready for pickup found." : `No order found matching "${pickupSearch}".`
+          isScan
+            ? "No orders are currently ready for customer pickup."
+            : `No pickup-ready order found matching "${pickupSearch}".`
         );
       }
     } catch (e) {
-      setPickupSearchErr("Lookup failed. Please try again.");
+      setPickupSearchErr(e.message || "Lookup failed. Please try again.");
       setPickupDebug({ caughtError: String(e) });
     } finally {
       setPickupSearching(false);
@@ -422,7 +384,6 @@ ${pickupExtra ? `Additional context: ${pickupExtra}` : ""}`;
     return { subject, body };
   };
 
-  // Fix 3: clipboard write is async — chain .then()/.catch() so permission denials don't throw
   const copyText = (text, setCopied) => {
     navigator.clipboard.writeText(text)
       .then(() => {
@@ -554,11 +515,9 @@ ${pickupExtra ? `Additional context: ${pickupExtra}` : ""}`;
     padding: "16px 18px",
   };
 
-  // ── API key + Google token gate ───────────────────────────────────────────────
+  // ── Setup gate ────────────────────────────────────────────────────────────────
   if (!apiKey || !googleToken) {
     const needsApiKey = !apiKey;
-    const canSubmitApiKey = apiKeyInput.trim();
-    const canSubmitGoogleToken = googleTokenInput.trim();
     return (
       <div style={{ fontFamily: "'Inter', 'Segoe UI', sans-serif", background: "#F7F8FA", minHeight: "100vh" }}>
         <div style={{ background: "#1A1F2E", padding: "20px 32px", display: "flex", alignItems: "center", gap: "12px" }}>
@@ -569,7 +528,7 @@ ${pickupExtra ? `Additional context: ${pickupExtra}` : ""}`;
           </div>
         </div>
         <div style={{ maxWidth: "480px", margin: "80px auto", padding: "0 24px", display: "flex", flexDirection: "column", gap: "16px" }}>
-          {needsApiKey && (
+          {needsApiKey ? (
             <div style={{ ...cardStyle, padding: "32px" }}>
               <div style={{ fontWeight: "700", fontSize: "15px", color: "#1A1F2E", marginBottom: "8px" }}>Anthropic API Key</div>
               <div style={{ fontSize: "13px", color: "#6B7A99", marginBottom: "20px" }}>Stored locally in this browser — never sent anywhere except Anthropic.</div>
@@ -577,44 +536,48 @@ ${pickupExtra ? `Additional context: ${pickupExtra}` : ""}`;
                 type="password"
                 value={apiKeyInput}
                 onChange={(e) => setApiKeyInput(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && canSubmitApiKey && saveApiKey()}
+                onKeyDown={(e) => e.key === "Enter" && apiKeyInput.trim() && saveApiKey()}
                 placeholder="sk-ant-..."
                 style={{ ...inputStyle, padding: "10px 14px", fontSize: "14px", marginBottom: "12px" }}
-                autoFocus={needsApiKey}
+                autoFocus
               />
               <button
                 onClick={saveApiKey}
-                disabled={!canSubmitApiKey}
-                style={{ background: canSubmitApiKey ? "#4A7CFF" : "#A0ABBE", color: "#fff", border: "none", borderRadius: "8px", padding: "12px 24px", fontSize: "13px", fontWeight: "700", cursor: canSubmitApiKey ? "pointer" : "not-allowed", width: "100%" }}
+                disabled={!apiKeyInput.trim()}
+                style={{ background: apiKeyInput.trim() ? "#4A7CFF" : "#A0ABBE", color: "#fff", border: "none", borderRadius: "8px", padding: "12px 24px", fontSize: "13px", fontWeight: "700", cursor: apiKeyInput.trim() ? "pointer" : "not-allowed", width: "100%" }}
               >
                 Save API Key
               </button>
             </div>
-          )}
-          {!needsApiKey && (
+          ) : (
             <div style={{ ...cardStyle, padding: "32px" }}>
               <div style={{ fontWeight: "700", fontSize: "15px", color: "#1A1F2E", marginBottom: "8px" }}>Google OAuth Token</div>
-              <div style={{ fontSize: "13px", color: "#6B7A99", marginBottom: "4px" }}>Required to read your Google Sheet via the Drive MCP connector.</div>
-              <div style={{ fontSize: "12px", color: "#6B7A99", marginBottom: "20px" }}>
+              <div style={{ fontSize: "13px", color: "#6B7A99", marginBottom: "4px" }}>Required to read your Google Sheet.</div>
+              <div style={{ fontSize: "12px", color: "#6B7A99", marginBottom: "20px", lineHeight: "1.6" }}>
                 Get a token from{" "}
                 <a href="https://developers.google.com/oauthplayground/" target="_blank" rel="noreferrer" style={{ color: "#4A7CFF" }}>
                   Google OAuth Playground
                 </a>
-                {" "}— select <strong>Drive API v3</strong> scope, authorize, then copy the Access Token. Tokens expire after 1 hour.
+                :{" "}
+                select <strong>Google Sheets API v4</strong> →{" "}
+                <code style={{ background: "#F0F2F7", padding: "1px 4px", borderRadius: "3px", fontSize: "11px" }}>
+                  https://www.googleapis.com/auth/spreadsheets.readonly
+                </code>
+                , authorize, exchange for tokens, then copy the <strong>Access Token</strong>. Expires after ~1 hour.
               </div>
               <input
                 type="password"
                 value={googleTokenInput}
                 onChange={(e) => setGoogleTokenInput(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && canSubmitGoogleToken && saveGoogleToken()}
+                onKeyDown={(e) => e.key === "Enter" && googleTokenInput.trim() && saveGoogleToken()}
                 placeholder="ya29.a0..."
                 style={{ ...inputStyle, padding: "10px 14px", fontSize: "14px", marginBottom: "12px" }}
                 autoFocus
               />
               <button
                 onClick={saveGoogleToken}
-                disabled={!canSubmitGoogleToken}
-                style={{ background: canSubmitGoogleToken ? "#4A7CFF" : "#A0ABBE", color: "#fff", border: "none", borderRadius: "8px", padding: "12px 24px", fontSize: "13px", fontWeight: "700", cursor: canSubmitGoogleToken ? "pointer" : "not-allowed", width: "100%" }}
+                disabled={!googleTokenInput.trim()}
+                style={{ background: googleTokenInput.trim() ? "#4A7CFF" : "#A0ABBE", color: "#fff", border: "none", borderRadius: "8px", padding: "12px 24px", fontSize: "13px", fontWeight: "700", cursor: googleTokenInput.trim() ? "pointer" : "not-allowed", width: "100%" }}
               >
                 Save & Continue
               </button>
