@@ -3,13 +3,15 @@
 // ─────────────────────────────────────────────
 var SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/YOUR/WEBHOOK/URL";
 
-var SPREADSHEET_ID    = "1GGPDtzu_BKb3x2bpzfWK794-H1ny9TTu_cQ2KiZ1eXY";
-var SHEET_NAME        = "Open Orders";
+var SPREADSHEET_ID     = "1GGPDtzu_BKb3x2bpzfWK794-H1ny9TTu_cQ2KiZ1eXY";
+var SHEET_NAME         = "Open Orders";
 
 // Header names exactly as they appear in row 1 of your sheet (case-insensitive match)
-var COL_ORDER_NUMBER  = "Order Number";
-var COL_PO_NUMBER     = "PO Number";
+var COL_ORDER_NUMBER   = "Order Number";
+var COL_PO_NUMBER      = "PO Number";
 var COL_SHIPPED_WEIGHT = "Shipped Weight";
+var COL_REQUESTED      = "Requested";
+var COL_RECEIVED       = "Received";
 // ─────────────────────────────────────────────
 
 function sendOpenOrdersToSlack() {
@@ -30,46 +32,64 @@ function sendOpenOrdersToSlack() {
   // Map header names → column indices
   var headers = data[0].map(function(h) { return String(h).trim().toLowerCase(); });
 
-  var idxOrder  = findColumn(headers, COL_ORDER_NUMBER);
-  var idxPO     = findColumn(headers, COL_PO_NUMBER);
-  var idxWeight = findColumn(headers, COL_SHIPPED_WEIGHT);
+  var idxOrder     = findColumn(headers, COL_ORDER_NUMBER);
+  var idxPO        = findColumn(headers, COL_PO_NUMBER);
+  var idxWeight    = findColumn(headers, COL_SHIPPED_WEIGHT);
+  var idxRequested = findColumn(headers, COL_REQUESTED);
+  var idxReceived  = findColumn(headers, COL_RECEIVED);
 
-  if (idxOrder === -1 || idxPO === -1 || idxWeight === -1) {
+  var missing = [];
+  if (idxOrder     === -1) missing.push(COL_ORDER_NUMBER);
+  if (idxPO        === -1) missing.push(COL_PO_NUMBER);
+  if (idxWeight    === -1) missing.push(COL_SHIPPED_WEIGHT);
+  if (idxRequested === -1) missing.push(COL_REQUESTED);
+  if (idxReceived  === -1) missing.push(COL_RECEIVED);
+
+  if (missing.length > 0) {
     Logger.log(
-      "Could not find one or more columns.\n" +
-      "Headers found: " + data[0].join(", ") + "\n" +
-      "Looking for: " + COL_ORDER_NUMBER + ", " + COL_PO_NUMBER + ", " + COL_SHIPPED_WEIGHT
+      "Could not find column(s): " + missing.join(", ") + "\n" +
+      "Headers found: " + data[0].join(", ")
     );
     return;
   }
 
-  // Build the order list (skip header row)
+  // Build the order list — skip blank rows and orders where BOL was already received
   var rows = [];
   for (var i = 1; i < data.length; i++) {
     var row = data[i];
-    var orderNum = row[idxOrder];
-    var poNum    = row[idxPO];
-    var weight   = row[idxWeight];
+    var orderNum  = row[idxOrder];
+    var poNum     = row[idxPO];
+    var weight    = row[idxWeight];
+    var requested = row[idxRequested];
+    var received  = row[idxReceived];
 
     // Skip blank rows
     if (!orderNum && !poNum) continue;
 
+    // Skip orders where we already have the BOL back
+    if (received && String(received).trim() !== "") continue;
+
+    var requestedLabel = (requested && String(requested).trim() !== "")
+      ? ":white_check_mark: " + requested
+      : ":hourglass: Not yet";
+
     rows.push(
       "*Order #:* " + orderNum +
       "   |   *PO #:* " + poNum +
-      "   |   *Shipped Weight:* " + weight
+      "   |   *Shipped Weight:* " + weight +
+      "   |   *BOL Requested:* " + requestedLabel
     );
   }
 
   if (rows.length === 0) {
-    Logger.log("No open orders to send.");
+    Logger.log("No pending orders — nothing to send.");
     return;
   }
 
   var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "MMMM d, yyyy");
 
   var message = {
-    text: ":package: *Open Orders Ready for Pickup — " + today + "*\n\n" + rows.join("\n")
+    text: ":package: *Open Orders Pending BOL — " + today + "* (" + rows.length + " order" + (rows.length === 1 ? "" : "s") + ")\n\n" + rows.join("\n")
   };
 
   var options = {
