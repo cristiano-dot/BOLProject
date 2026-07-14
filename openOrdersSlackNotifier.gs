@@ -28,8 +28,8 @@ function onCellEdit(e) {
   var sheet = e.range.getSheet();
   if (sheet.getName() !== SHEET_NAME) return;
 
-  var ss      = SpreadsheetApp.getActiveSpreadsheet();
-  var data    = sheet.getDataRange().getValues();
+  var ss   = SpreadsheetApp.openById(SPREADSHEET_ID);
+  var data = sheet.getDataRange().getValues();
   var headers = data[0].map(function(h) { return String(h).trim().toLowerCase(); });
 
   var idxOrder     = findColumn(headers, COL_ORDER_NUMBER);
